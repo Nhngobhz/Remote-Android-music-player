@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Music Controller</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="login" class="overlay" hidden>
+    <form id="login-form" class="card login-card">
+      <h1>Music Controller</h1>
+      <p class="muted">Enter the 6-digit PIN shown on the phone.</p>
+      <input id="pin-input" inputmode="numeric" autocomplete="off" maxlength="6" placeholder="000000" aria-label="PIN" required>
+      <button type="submit" class="primary">Connect</button>
+      <p id="login-error" class="error" role="alert"></p>
+    </form>
+  </div>
+
+  <div id="app" hidden>
+    <header class="topbar">
+      <div class="brand">Music Controller</div>
+      <div class="topbar-right">
+        <div id="conn" class="conn"><span class="dot"></span><span id="conn-text">Connected</span></div>
+        <button id="logout" class="link">Change PIN</button>
+      </div>
+    </header>
+
+    <section class="player card">
+      <div class="now">
+        <div id="now-title" class="now-title">Nothing playing</div>
+        <div id="now-sub" class="now-sub muted"></div>
+      </div>
+      <div class="seek">
+        <span id="pos" class="time">0:00</span>
+        <input type="range" id="seek" min="0" max="0" value="0" step="1000" aria-label="Seek">
+        <span id="dur" class="time">0:00</span>
+      </div>
+      <div class="controls">
+        <button id="btn-shuffle" class="icon toggle" title="Shuffle" aria-label="Shuffle">
+          <svg viewBox="0 0 24 24"><path d="M10.6 9.2 5.4 4 4 5.4l5.2 5.2 1.4-1.4ZM14.5 4l2 2L4 18.6 5.4 20 18 7.5l2 2V4h-5.5Zm.3 9.4-1.4 1.4 3.1 3.1-2 2.1H20v-5.5l-2 2-3.2-3.1Z"/></svg>
+        </button>
+        <button id="btn-prev" class="icon" title="Previous" aria-label="Previous">
+          <svg viewBox="0 0 24 24"><path d="M6 6h2v12H6zm3.5 6 8.5 6V6z"/></svg>
+        </button>
+        <button id="btn-play" class="icon big" title="Play" aria-label="Play"></button>
+        <button id="btn-next" class="icon" title="Next" aria-label="Next">
+          <svg viewBox="0 0 24 24"><path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z"/></svg>
+        </button>
+        <button id="btn-repeat" class="icon toggle" title="Repeat" aria-label="Repeat">
+          <svg viewBox="0 0 24 24"><path d="M7 7h10v3l4-4-4-4v3H5v6h2V7Zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4Z"/></svg>
+          <span id="repeat-one" class="badge" hidden>1</span>
+        </button>
+        <label class="volume" title="Volume">
+          <svg viewBox="0 0 24 24"><path d="M3 9v6h4l5 5V4L7 9H3Zm13.5 3A4.5 4.5 0 0 0 14 8v8a4.5 4.5 0 0 0 2.5-4ZM14 3.2v2.1a7 7 0 0 1 0 13.4v2.1a9 9 0 0 0 0-17.6Z"/></svg>
+          <input type="range" id="volume" min="0" max="100" value="100" aria-label="Volume">
+        </label>
+      </div>
+    </section>
+
+    <main class="layout">
+      <aside class="sidebar card">
+        <h2>Folders</h2>
+        <ul id="folder-list" class="folders"></ul>
+        <form id="new-folder-form" class="inline-form">
+          <input id="new-folder-name" placeholder="New folder name" maxlength="80" required>
+          <button type="submit">Add</button>
+        </form>
+      </aside>
+
+      <section class="content">
+        <div class="card">
+          <h2>Add music</h2>
+          <form id="yt-form" class="inline-form">
+            <input id="yt-url" placeholder="Paste a YouTube video or playlist link" required>
+            <button type="submit" id="yt-submit" class="primary">Download</button>
+          </form>
+          <label id="drop-zone" class="drop-zone">
+            <input type="file" id="file-input" multiple accept="audio/*,.mp3,.m4a,.aac,.ogg,.oga,.opus,.wav,.flac,.webm,.mp4">
+            <span>Drop music files here, or click to choose</span>
+          </label>
+          <p id="add-target" class="hint muted"></p>
+          <p id="ytdlp" class="hint muted" hidden>
+            <span id="ytdlp-text"></span>
+            <button id="ytdlp-update" class="link">Check for update</button>
+          </p>
+          <ul id="upload-list" class="progress-list"></ul>
+        </div>
+
+        <div id="jobs-card" class="card" hidden>
+          <div class="card-head">
+            <h2>Downloads</h2>
+            <button id="clear-jobs" class="link">Clear finished</button>
+          </div>
+          <ul id="job-list" class="progress-list"></ul>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2 id="folder-title">All music</h2>
+            <div class="actions">
+              <button id="play-folder" class="primary">Play</button>
+              <button id="shuffle-folder">Shuffle</button>
+              <button id="rename-folder">Rename</button>
+              <button id="delete-folder" class="danger">Delete</button>
+            </div>
+          </div>
+          <ul id="track-list" class="tracks"></ul>
+          <p id="empty-tracks" class="empty muted" hidden>No songs here yet. Paste a YouTube link or drop files above.</p>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div id="toast" class="toast" role="status" hidden></div>
+  <script src="app.js"></script>
+</body>
+</html>
