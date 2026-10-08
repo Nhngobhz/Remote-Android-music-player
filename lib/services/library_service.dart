@@ -8,15 +8,21 @@ import 'package:uuid/uuid.dart';
 
 import '../models/music_folder.dart';
 import '../models/track.dart';
+import 'media_tools.dart';
 
 class LibraryService extends ChangeNotifier {
+  /// Files the phone can play the sound of, video files included.
   static const audioExtensions = {
-    'mp3', 'm4a', 'aac', 'ogg', 'oga', 'opus', 'wav', 'flac', 'webm', 'mp4',
+    'mp3', 'm4a', 'aac', 'ogg', 'oga', 'opus', 'wav', 'flac', 'webm', 'mp4', 'm4v', 'mov', 'mkv',
   };
+
+  /// Video files for the karaoke screen, in containers browsers play.
+  static const videoExtensions = {'mp4', 'm4v', 'mov', 'webm', 'mkv'};
   static const _maxNameLength = 80;
   static const _uuid = Uuid();
 
   late final Directory _root;
+  late final Directory _incoming;
   late final File _manifest;
 
   final List<MusicFolder> _folders = [];
@@ -42,6 +48,9 @@ class LibraryService extends ChangeNotifier {
     await for (final entry in tracksDir.list()) {
       if (entry is File && entry.path.endsWith('.part')) await entry.delete();
     }
+    _incoming = Directory('${_root.path}/incoming');
+    if (await _incoming.exists()) await _incoming.delete(recursive: true);
+    await _incoming.create();
     _manifest = File('${_root.path}/library.json');
 
     if (await _manifest.exists()) {
@@ -55,13 +64,35 @@ class LibraryService extends ChangeNotifier {
       _folders.insert(0, MusicFolder(id: MusicFolder.unsortedId, name: 'Unsorted'));
     }
     final missing = _tracks.where((t) => !File(pathOf(t)).existsSync()).toList();
-    if (missing.isNotEmpty) {
-      _tracks.removeWhere(missing.contains);
-      _save();
+    var changed = missing.isNotEmpty;
+    _tracks.removeWhere(missing.contains);
+    // A lost video or subtitle file only takes that extra away; the song still plays.
+    for (final track in _tracks) {
+      final video = track.videoFileName;
+      if (video != null && !File(_pathFor(video)).existsSync()) {
+        track.videoFileName = null;
+        changed = true;
+      }
+      final before = track.subtitleFileNames.length;
+      track.subtitleFileNames.removeWhere((_, name) => !File(_pathFor(name)).existsSync());
+      changed |= track.subtitleFileNames.length != before;
     }
+    if (changed) _save();
   }
 
-  String pathOf(Track track) => '${_root.path}/${track.fileName}';
+  String pathOf(Track track) => _pathFor(track.fileName);
+
+  String? videoPathOf(Track track) {
+    final name = track.videoFileName;
+    return name == null ? null : _pathFor(name);
+  }
+
+  String? subtitlePathOf(Track track, String language) {
+    final name = track.subtitleFileNames[language];
+    return name == null ? null : _pathFor(name);
+  }
+
+  String _pathFor(String fileName) => '${_root.path}/$fileName';
 
   MusicFolder? folderById(String id) => _folders.where((f) => f.id == id).firstOrNull;
 
@@ -108,7 +139,9 @@ class LibraryService extends ChangeNotifier {
     _changed();
   }
 
-  /// Streams [data] straight to disk so large uploads/downloads never sit in memory.
+  /// Streams [data] straight to disk so large uploads never sit in memory. A video keeps
+  /// its picture for the karaoke screen, and its sound is copied into a file of its own,
+  /// so the phone plays the sound without decoding the picture.
   Future<Track> importStream(
     Stream<List<int>> data, {
     required String extension,
@@ -123,38 +156,122 @@ class LibraryService extends ChangeNotifier {
     if (!audioExtensions.contains(ext)) {
       throw ArgumentError('Unsupported audio format: .$ext');
     }
-    final id = _uuid.v4();
-    final fileName = 'tracks/$id.$ext';
-    final partial = File('${_root.path}/$fileName.part');
+    final file = File('${_incoming.path}/${_uuid.v4()}.$ext');
+    VideoParts? parts;
     try {
       // Not IOSink.addStream: it swallows the stream's error and close() then throws "File closed".
-      final file = await partial.open(mode: FileMode.write);
+      final sink = await file.open(mode: FileMode.write);
       try {
         await for (final chunk in data) {
-          await file.writeFrom(chunk);
+          await sink.writeFrom(chunk);
         }
       } finally {
-        await file.close();
+        await sink.close();
       }
-      await partial.rename('${_root.path}/$fileName');
+
+      if (videoExtensions.contains(ext)) {
+        parts = await MediaTools.splitVideo(file, '${file.path}.sound');
+        if (parts != null && parts.hasVideo && !parts.hasAudio) {
+          throw const FormatException('This video has no sound for the phone to play');
+        }
+      }
+      // A video the phone couldn't look inside is still worth showing; the browser decides.
+      final hasVideo = videoExtensions.contains(ext) && (parts?.hasVideo ?? true);
+      return await importFiles(
+        audio: parts?.audio ?? file,
+        video: hasVideo ? file : null,
+        title: title,
+        source: source,
+        folderId: folderId,
+        artist: artist,
+        durationMs: durationMs ?? parts?.durationMs,
+        sourceUrl: sourceUrl,
+      );
     } catch (_) {
-      if (await partial.exists()) await partial.delete();
+      for (final leftover in [file, ?parts?.audio]) {
+        if (await leftover.exists()) await leftover.delete();
+      }
       rethrow;
     }
+  }
 
-    final track = Track(
-      id: id,
-      title: _cleanName(title, fallback: 'Untitled'),
-      artist: artist,
-      fileName: fileName,
-      folderId: (folderId != null && folderById(folderId) != null)
-          ? folderId
-          : MusicFolder.unsortedId,
-      durationMs: durationMs,
-      source: source,
-      sourceUrl: sourceUrl,
-      addedAt: DateTime.now(),
-    );
+  /// Moves downloaded files into the library: [audio] for the phone to play, and
+  /// optionally a [video] and [subtitles] (WebVTT by language code) for the karaoke screen.
+  /// [video] may be [audio] itself, for a video whose sound couldn't be split off.
+  Future<Track> importFiles({
+    required File audio,
+    required String title,
+    required TrackSource source,
+    File? video,
+    Map<String, File> subtitles = const {},
+    String? folderId,
+    String? artist,
+    int? durationMs,
+    String? sourceUrl,
+  }) async {
+    final ext = fileExtension(audio.path);
+    if (!audioExtensions.contains(ext)) {
+      throw ArgumentError('Unsupported audio format: .$ext');
+    }
+    final id = _uuid.v4();
+    final moved = <File>[];
+    Future<String> take(File file, String fileName) async {
+      moved.add(await _moveInto(file, fileName));
+      return fileName;
+    }
+
+    try {
+      final fileName = await take(audio, 'tracks/$id.$ext');
+      final videoFileName = video == null
+          ? null
+          : video.path == audio.path
+              ? fileName
+              : await take(video, 'tracks/$id.video.${fileExtension(video.path)}');
+      final subtitleFileNames = <String, String>{};
+      for (final MapEntry(key: language, value: file) in subtitles.entries) {
+        final safe = language.replaceAll(RegExp(r'[^A-Za-z0-9_-]'), '');
+        if (safe.isEmpty || subtitleFileNames.containsKey(safe)) continue;
+        subtitleFileNames[safe] = await take(file, 'tracks/$id.$safe.vtt');
+      }
+      return _add(Track(
+        id: id,
+        title: _cleanName(title, fallback: 'Untitled'),
+        artist: artist,
+        fileName: fileName,
+        videoFileName: videoFileName,
+        subtitleFileNames: subtitleFileNames,
+        folderId: _folderOrUnsorted(folderId),
+        durationMs: durationMs,
+        source: source,
+        sourceUrl: sourceUrl,
+        addedAt: DateTime.now(),
+      ));
+    } catch (_) {
+      for (final file in moved) {
+        await file.delete().catchError((_) => file);
+      }
+      rethrow;
+    }
+  }
+
+  /// Renames [file] into the library, or copies it when it is on another drive. A copy
+  /// goes through a .part file, so a crash never leaves half a file under the real name.
+  Future<File> _moveInto(File file, String fileName) async {
+    final target = _pathFor(fileName);
+    try {
+      return await file.rename(target);
+    } on FileSystemException {
+      final partial = await file.copy('$target.part');
+      final copied = await partial.rename(target);
+      await file.delete();
+      return copied;
+    }
+  }
+
+  String _folderOrUnsorted(String? folderId) =>
+      (folderId != null && folderById(folderId) != null) ? folderId : MusicFolder.unsortedId;
+
+  Track _add(Track track) {
     _tracks.add(track);
     _changed();
     _trackAdded.add(track);
@@ -173,8 +290,10 @@ class LibraryService extends ChangeNotifier {
     _tracks.remove(track);
     _changed();
     _trackRemoved.add(track);
-    final file = File(pathOf(track));
-    if (await file.exists()) await file.delete();
+    for (final name in {track.fileName, ?track.videoFileName, ...track.subtitleFileNames.values}) {
+      final file = File(_pathFor(name));
+      if (await file.exists()) await file.delete();
+    }
   }
 
   MusicFolder _requireFolder(String id) =>

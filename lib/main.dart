@@ -28,7 +28,7 @@ Future<void> main() async {
   );
   final ytDlp = YtDlpService();
   unawaited(ytDlp.start());
-  final youtube = YoutubeService(library, ytDlp: ytDlp);
+  final youtube = YoutubeService(library, ytDlp);
   final server = ControlServer(
     library: library,
     player: player,

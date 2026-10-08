@@ -2,8 +2,15 @@
 
 const ICON_PLAY = '<svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>';
 const ICON_PAUSE = '<svg viewBox="0 0 24 24"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>';
-const AUDIO_EXTENSIONS = ['mp3', 'm4a', 'aac', 'ogg', 'oga', 'opus', 'wav', 'flac', 'webm', 'mp4'];
+const AUDIO_EXTENSIONS = ['mp3', 'm4a', 'aac', 'ogg', 'oga', 'opus', 'wav', 'flac'];
+// The phone plays a video's sound and the karaoke screen shows its picture.
+const VIDEO_EXTENSIONS = ['mp4', 'm4v', 'mov', 'webm', 'mkv'];
 const JOB_LABELS = { queued: 'Waiting', fetching: 'Looking up…', downloading: 'Downloading', done: 'Added', failed: 'Failed' };
+
+// "/?screen" opens just the karaoke screen, e.g. in a window on a TV.
+const SCREEN_MODE = new URLSearchParams(location.search).has('screen');
+const SYNC_STEP_MS = 100;
+const SYNC_LIMIT_MS = 3000;
 
 const state = {
   pin: null,
@@ -16,6 +23,18 @@ const state = {
   volumeDragging: false,
   currentTrackId: null,
   jobRows: new Map(),
+};
+
+// The karaoke screen: the current song's video and lyrics, following the phone.
+const stage = {
+  trackId: undefined, // song whose video and lyrics are loaded; null when nothing plays
+  hasVideo: false,
+  subtitles: [],
+  lyricsLang: 'off',
+  cues: [],
+  clock: null, // estimate of the phone's playback position, see updatePhoneClock
+  offsetMs: 0, // how much later than the music the video and lyrics are shown
+  barTimer: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -32,14 +51,18 @@ function el(tag, props = {}, children = []) {
   return node;
 }
 
-function storage(action, value) {
-  try {
-    if (action === 'get') return localStorage.getItem('mc-pin');
-    if (action === 'set') localStorage.setItem('mc-pin', value);
-    if (action === 'clear') localStorage.removeItem('mc-pin');
-  } catch { /* storage unavailable (private mode); PIN just won't be remembered */ }
-  return null;
-}
+// Per-browser settings. Storage may be unavailable (private mode); then nothing is remembered.
+const prefs = {
+  get(key) {
+    try { return localStorage.getItem(key); } catch { return null; }
+  },
+  set(key, value) {
+    try { localStorage.setItem(key, value); } catch { /* not remembered */ }
+  },
+  remove(key) {
+    try { localStorage.removeItem(key); } catch { /* not remembered */ }
+  },
+};
 
 function formatTime(ms) {
   if (ms == null || !isFinite(ms) || ms < 0) return '0:00';
@@ -113,10 +136,11 @@ async function login(pin) {
     state.pin = null;
     throw e;
   }
-  storage('set', pin);
+  prefs.set('mc-pin', pin);
   $('login').hidden = true;
-  $('app').hidden = false;
+  $('app').hidden = SCREEN_MODE;
   state.library.version = -1;
+  stage.trackId = undefined; // reload media, whose links carry the PIN
   poll();
 }
 
@@ -124,6 +148,8 @@ function showLogin(message = '', prefill = '') {
   state.pin = null;
   clearTimeout(state.pollTimer);
   $('app').hidden = true;
+  $('stage').hidden = true;
+  $('stage-video').pause();
   $('login').hidden = false;
   $('login-error').textContent = message;
   $('pin-input').value = prefill;
@@ -131,7 +157,7 @@ function showLogin(message = '', prefill = '') {
 }
 
 function logout(message = '') {
-  storage('clear');
+  prefs.remove('mc-pin');
   showLogin(message);
 }
 
@@ -139,12 +165,16 @@ async function poll() {
   clearTimeout(state.pollTimer);
   if (!state.pin) return;
   try {
+    const sent = performance.now();
     const status = await api('status');
     setConnected(true);
-    applyPlayer(status.player);
-    renderJobs(status.jobs);
-    renderYtDlp(status.ytDlp);
-    if (status.libraryVersion !== state.library.version) await refreshLibrary();
+    // The phone read its position somewhere between sending and receiving; take the middle.
+    applyPlayer(status.player, (sent + performance.now()) / 2);
+    if (!SCREEN_MODE) {
+      renderJobs(status.jobs);
+      renderYtDlp(status.ytDlp);
+      if (status.libraryVersion !== state.library.version) await refreshLibrary();
+    }
   } catch (e) {
     if (e.status === 401) {
       logout('The PIN changed on the phone. Enter the new one.');
@@ -158,6 +188,7 @@ async function poll() {
 function setConnected(ok) {
   $('conn').classList.toggle('offline', !ok);
   $('conn-text').textContent = ok ? 'Connected' : "Can't reach the phone";
+  $('stage-offline').hidden = ok;
 }
 
 async function refreshLibrary() {
@@ -171,9 +202,10 @@ async function refreshLibrary() {
 
 // ---------- Player ----------
 
-function applyPlayer(player) {
+function applyPlayer(player, sampledAt = performance.now()) {
   state.player = player;
   state.playerReceivedAt = performance.now();
+  updatePhoneClock(player, sampledAt);
   renderPlayer();
 }
 
@@ -220,6 +252,7 @@ function renderPlayer() {
     highlightCurrentTrack();
   }
   renderFolderPlayingDots();
+  renderStage();
 }
 
 function renderSeek() {
@@ -232,6 +265,237 @@ function renderSeek() {
   seek.disabled = !p.track || !duration;
   $('pos').textContent = formatTime(currentPosition());
   $('dur').textContent = formatTime(duration);
+}
+
+// ---------- Karaoke screen ----------
+
+// Video and subtitle elements can't send the PIN header, so it goes in the link.
+function mediaUrl(path) {
+  return `/api/${path}?pin=${encodeURIComponent(state.pin || '')}`;
+}
+
+// Where the phone is in the song. Polls come once a second over Wi-Fi, so each one nudges
+// a running estimate instead of replacing it; that keeps network jitter out of the video.
+// A big jump (a seek, a new song, play/pause) starts the estimate over.
+function updatePhoneClock(p, sampledAt) {
+  const playing = !!(p.playing && p.processing === 'ready');
+  const trackId = p.track?.id ?? null;
+  const c = stage.clock;
+  if (c && playing && c.playing && c.trackId === trackId) {
+    const predicted = c.pos + (sampledAt - c.at);
+    const error = p.positionMs - predicted;
+    if (Math.abs(error) < 500) {
+      stage.clock = { trackId, playing, at: sampledAt, pos: predicted + error * 0.3 };
+      return;
+    }
+  }
+  stage.clock = { trackId, playing, at: sampledAt, pos: p.positionMs };
+}
+
+function phonePosition() {
+  const c = stage.clock;
+  if (!c) return 0;
+  return c.pos + (c.playing ? performance.now() - c.at : 0);
+}
+
+function renderStage() {
+  const track = state.player?.track ?? null;
+  if ((track?.id ?? null) !== stage.trackId) loadStageTrack(track);
+  const show = SCREEN_MODE || stage.hasVideo || stage.subtitles.length > 0;
+  $('stage').hidden = !show;
+  $('player').classList.toggle('has-stage', show && !SCREEN_MODE);
+}
+
+function loadStageTrack(track) {
+  stage.trackId = track?.id ?? null;
+  stage.hasVideo = !!track?.hasVideo;
+  stage.subtitles = track?.subtitles ?? [];
+  const video = $('stage-video');
+  video.hidden = !stage.hasVideo;
+  if (stage.hasVideo) {
+    video.src = mediaUrl(`tracks/${track.id}/video`);
+  } else if (video.hasAttribute('src')) {
+    video.removeAttribute('src');
+    video.load(); // lets go of the previous song's video
+  }
+  $('stage-title-text').textContent = track ? track.title : 'Nothing playing';
+  $('stage-title-sub').textContent = track?.artist ?? '';
+  renderLyricsChoices();
+  loadLyrics();
+}
+
+const languageNames = (() => {
+  try { return new Intl.DisplayNames([navigator.language, 'en'], { type: 'language' }); } catch { return null; }
+})();
+
+// "km" -> "Khmer". YouTube also has codes like "en-nP7-2PuUl7o" for a second English track.
+function languageName(code) {
+  const base = code.split('-')[0];
+  for (const candidate of [code, base]) {
+    try {
+      const name = languageNames?.of(candidate);
+      if (name && name !== candidate) return candidate === code ? name : `${name} (${code})`;
+    } catch { /* not a language tag */ }
+  }
+  return code;
+}
+
+function renderLyricsChoices() {
+  const select = $('lyrics-lang');
+  select.replaceChildren(
+    el('option', { value: 'off', text: 'Lyrics off' }),
+    ...stage.subtitles.map((code) => el('option', { value: code, text: languageName(code) })),
+  );
+  select.hidden = stage.subtitles.length === 0;
+  stage.lyricsLang = pickLyrics(stage.subtitles);
+  select.value = stage.lyricsLang;
+}
+
+// The language chosen last time (or the same language from another region), else the first.
+function pickLyrics(codes) {
+  const wanted = prefs.get('mc-lyrics');
+  if (wanted === 'off' || codes.length === 0) return 'off';
+  const base = (code) => code.split('-')[0].toLowerCase();
+  return codes.find((c) => c === wanted)
+    ?? codes.find((c) => wanted && base(c) === base(wanted))
+    ?? codes[0];
+}
+
+async function loadLyrics() {
+  stage.cues = [];
+  const { trackId, lyricsLang } = stage;
+  if (!trackId || lyricsLang === 'off') return;
+  try {
+    const res = await fetch(mediaUrl(`tracks/${trackId}/subtitles/${encodeURIComponent(lyricsLang)}`));
+    if (!res.ok) return;
+    const cues = parseVtt(await res.text());
+    if (stage.trackId === trackId && stage.lyricsLang === lyricsLang) stage.cues = cues;
+  } catch { /* no lyrics this time; the video carries on */ }
+}
+
+// WebVTT cues as { from, to, text } in milliseconds, without styling tags.
+function parseVtt(text) {
+  const cues = [];
+  for (const block of text.replace(/\r\n?/g, '\n').split(/\n{2,}/)) {
+    const lines = block.split('\n');
+    const at = lines.findIndex((line) => line.includes('-->'));
+    if (at < 0) continue; // the header, NOTE and STYLE blocks
+    const [from, to] = lines[at].split('-->').map((part) => vttTime(part.trim().split(/\s+/)[0]));
+    const body = decodeHtml(lines.slice(at + 1).join('\n').replace(/<[^>]*>/g, '')).trim();
+    if (from != null && to != null && body) cues.push({ from, to, text: body });
+  }
+  return cues;
+}
+
+function vttTime(text) {
+  const m = /^(?:(\d+):)?(\d{1,2}):(\d{2})[.,](\d{3})$/.exec(text ?? '');
+  if (!m) return null;
+  return ((Number(m[1] ?? 0) * 60 + Number(m[2])) * 60 + Number(m[3])) * 1000 + Number(m[4]);
+}
+
+// Turns "&amp;" into "&". A textarea's content is never parsed as markup, so this is safe.
+const entityDecoder = document.createElement('textarea');
+function decodeHtml(text) {
+  entityDecoder.innerHTML = text;
+  return entityDecoder.value;
+}
+
+// Runs ten times a second while the karaoke screen shows.
+function tickStage() {
+  if ($('stage').hidden) return;
+  const at = phonePosition() - stage.offsetMs;
+  syncVideo(at / 1000);
+  const lyrics = stage.cues.filter((c) => c.from <= at && at < c.to).map((c) => c.text).join('\n');
+  const line = $('stage-lyrics');
+  if (line.textContent !== lyrics) line.textContent = lyrics;
+  line.hidden = !lyrics;
+  $('stage-title').hidden = stage.hasVideo;
+}
+
+// The video follows the music on the phone. Small drifts are evened out by playing a little
+// faster or slower, which looks smoother than jumping; big ones (a seek, a new song) jump.
+function syncVideo(target) {
+  const video = $('stage-video');
+  if (!stage.hasVideo || video.readyState < HTMLMediaElement.HAVE_METADATA || video.seeking) return;
+  const end = Number.isFinite(video.duration) ? video.duration : Infinity;
+  const at = Math.min(Math.max(target, 0), end);
+  const playing = stage.clock?.playing && !document.hidden && target < end;
+  if (!playing) {
+    if (!video.paused) video.pause();
+    if (Math.abs(video.currentTime - at) > 0.25) video.currentTime = at;
+    return;
+  }
+  const drift = video.currentTime - at;
+  if (video.paused || Math.abs(drift) > 1.5) {
+    video.currentTime = at;
+    video.playbackRate = 1;
+    if (video.paused) video.play().catch(() => { /* retried on the next tick */ });
+    return;
+  }
+  video.playbackRate = Math.abs(drift) < 0.025 ? 1 : Math.min(1.25, Math.max(0.8, 1 - drift));
+}
+
+function setSyncOffset(ms) {
+  stage.offsetMs = Math.max(-SYNC_LIMIT_MS, Math.min(SYNC_LIMIT_MS, Math.round(ms / SYNC_STEP_MS) * SYNC_STEP_MS));
+  prefs.set('mc-sync', String(stage.offsetMs));
+  const seconds = stage.offsetMs / 1000;
+  const sign = seconds > 0 ? '+' : seconds < 0 ? '−' : '';
+  $('sync-value').textContent = `${sign}${Math.abs(seconds).toFixed(1)} s`;
+}
+
+function toggleFullscreen() {
+  if (document.fullscreenElement) {
+    document.exitFullscreen().catch(() => {});
+  } else {
+    $('stage').requestFullscreen().catch(() => toast("The browser wouldn't go full screen", true));
+  }
+}
+
+// The control bar shows while the mouse moves over the video, then gets out of the way.
+function showStageBar() {
+  const node = $('stage');
+  node.classList.add('active');
+  node.classList.remove('idle');
+  clearTimeout(stage.barTimer);
+  stage.barTimer = setTimeout(() => {
+    node.classList.remove('active');
+    node.classList.add('idle');
+  }, 2500);
+}
+
+function wireStage() {
+  const node = $('stage');
+  node.addEventListener('pointermove', showStageBar);
+  node.addEventListener('pointerdown', showStageBar);
+  node.addEventListener('pointerleave', () => node.classList.remove('active'));
+  node.addEventListener('dblclick', (e) => {
+    if (!e.target.closest('.stage-bar')) toggleFullscreen();
+  });
+  document.addEventListener('fullscreenchange', () => {
+    $('stage-full').textContent = document.fullscreenElement ? 'Exit full screen' : 'Full screen';
+  });
+  $('stage-full').addEventListener('click', toggleFullscreen);
+  $('stage-window').addEventListener('click', () => {
+    const screen = window.open('/?screen', 'mc-karaoke', 'popup,width=1280,height=720');
+    if (!screen) toast('The browser blocked the new window. Allow pop-ups for this page.', true);
+  });
+  $('sync-earlier').addEventListener('click', () => setSyncOffset(stage.offsetMs - SYNC_STEP_MS));
+  $('sync-later').addEventListener('click', () => setSyncOffset(stage.offsetMs + SYNC_STEP_MS));
+  $('lyrics-lang').addEventListener('change', (e) => {
+    stage.lyricsLang = e.target.value;
+    prefs.set('mc-lyrics', stage.lyricsLang);
+    loadLyrics();
+  });
+
+  const video = $('stage-video');
+  video.addEventListener('error', () => {
+    if (!video.getAttribute('src')) return;
+    stage.hasVideo = false; // the title and lyrics show instead
+    video.hidden = true;
+  });
+
+  setSyncOffset(Number(prefs.get('mc-sync')) || 0);
+  setInterval(tickStage, 100);
 }
 
 // ---------- Folders ----------
@@ -309,6 +573,9 @@ function renderTracks() {
     if (track.artist) subParts.push(track.artist);
     if (state.selectedFolder === 'all') subParts.push(folderName(track.folderId));
     subParts.push(track.source === 'youtube' ? 'YouTube' : 'Uploaded');
+    const tags = [];
+    if (track.hasVideo) tags.push(el('span', { class: 'tag', text: 'Video' }));
+    if (track.subtitles?.length) tags.push(el('span', { class: 'tag', text: 'Lyrics' }));
 
     const playBtn = el('button', {
       class: 'icon play-btn',
@@ -322,7 +589,7 @@ function renderTracks() {
       playBtn,
       el('div', { class: 't-main' }, [
         el('div', { class: 't-title', text: track.title, title: track.title }),
-        el('div', { class: 't-sub', text: subParts.join(' · ') }),
+        el('div', { class: 't-sub' }, [...tags, subParts.join(' · ')]),
       ]),
       el('span', { class: 't-dur', text: track.durationMs ? formatTime(track.durationMs) : '' }),
       el('div', { class: 't-actions' }, [
@@ -375,7 +642,8 @@ function renderJobs(jobs) {
       state.jobRows.set(job.id, row);
     }
     if (list.children[index] !== row.li) list.insertBefore(row.li, list.children[index] ?? null);
-    row.label.textContent = job.title || job.url;
+    row.videoTag.hidden = !job.video;
+    row.labelText.textContent = job.title || job.url;
     row.label.title = job.url;
     const pct = Math.round(job.progress * 100);
     row.state.textContent = job.status === 'downloading' ? `${pct}%` : JOB_LABELS[job.status];
@@ -394,7 +662,9 @@ function renderJobs(jobs) {
 }
 
 function createJobRow(jobId) {
-  const label = el('span', { class: 'label' });
+  const videoTag = el('span', { class: 'tag', text: 'Video', hidden: '' });
+  const labelText = document.createTextNode('');
+  const label = el('span', { class: 'label' }, [videoTag, labelText]);
   const stateText = el('span', { class: 'state' });
   const fill = el('div');
   const bar = el('div', { class: 'bar' }, [fill]);
@@ -406,15 +676,15 @@ function createJobRow(jobId) {
   });
   const error = el('div', { class: 'job-error' }, [errorText, retry]);
   const li = el('li', {}, [el('div', { class: 'progress-row' }, [label, stateText]), bar, error]);
-  return { li, label, state: stateText, bar, fill, error, errorText };
+  return { li, label, labelText, videoTag, state: stateText, bar, fill, error, errorText };
 }
 
-// yt-dlp downloads the videos the app's built-in downloader can't get.
+// The phone downloads with yt-dlp, which keeps itself up to date.
 function renderYtDlp(info) {
   $('ytdlp').hidden = !info;
   if (!info) return;
   let text = info.updating ? 'Updating yt-dlp…'
-    : info.version ? `Backup downloader: yt-dlp ${info.version}` : 'Backup downloader: yt-dlp is starting…';
+    : info.version ? `Downloads use yt-dlp ${info.version}` : 'yt-dlp is starting…';
   if (info.updateError && !info.updating) text += ` (last update failed: ${info.updateError})`;
   $('ytdlp-text').textContent = text;
   $('ytdlp-update').disabled = info.updating;
@@ -461,24 +731,26 @@ async function uploadFiles(fileList) {
   // Sequential keeps the phone's disk and Wi-Fi from being swamped by a big drop.
   for (const file of files) {
     const ext = file.name.includes('.') ? file.name.split('.').pop().toLowerCase() : '';
-    const label = el('span', { class: 'label', text: file.name });
+    const videoTag = el('span', { class: 'tag', text: 'Video', hidden: '' });
+    const label = el('span', { class: 'label' }, [videoTag, file.name]);
     const status = el('span', { class: 'state', text: 'Waiting' });
     const fill = el('div');
     const li = el('li', {}, [el('div', { class: 'progress-row' }, [label, status]), el('div', { class: 'bar' }, [fill])]);
     list.append(li);
 
-    if (!AUDIO_EXTENSIONS.includes(ext)) {
-      status.textContent = 'Not an audio file';
+    if (!AUDIO_EXTENSIONS.includes(ext) && !VIDEO_EXTENSIONS.includes(ext)) {
+      status.textContent = 'Not a music or video file';
       status.classList.add('failed');
       setTimeout(() => li.remove(), 6000);
       continue;
     }
     try {
-      await uploadFile(file, folderId, (fraction) => {
+      const result = await uploadFile(file, folderId, (fraction) => {
         const pct = Math.round(fraction * 100);
         fill.style.width = pct + '%';
         status.textContent = pct < 100 ? `${pct}%` : 'Saving…';
       });
+      videoTag.hidden = !result?.added?.some((t) => t.hasVideo);
       fill.style.width = '100%';
       status.textContent = 'Added';
       status.classList.add('done');
@@ -578,18 +850,23 @@ function wire() {
     const button = $('yt-submit');
     button.disabled = true;
     button.textContent = 'Working…';
+    const video = $('yt-video').checked;
     const result = await run(() => api('youtube', {
       method: 'POST',
-      body: { url: input.value, folderId: targetFolderId() },
+      body: { url: input.value, folderId: targetFolderId(), video },
     }));
     button.disabled = false;
     button.textContent = 'Download';
     if (!result) return;
     input.value = '';
     const n = result.jobs.length;
-    toast(n === 1 ? 'Added to downloads' : `Added ${n} songs from the playlist to downloads`);
+    const what = n === 1 ? 'Added to downloads' : `Added ${n} songs from the playlist to downloads`;
+    toast(video ? `${what}, with video` : what);
     poll();
   });
+  const withVideo = prefs.get('mc-yt-video');
+  if (withVideo !== null) $('yt-video').checked = withVideo === '1';
+  $('yt-video').addEventListener('change', (e) => prefs.set('mc-yt-video', e.target.checked ? '1' : '0'));
 
   $('clear-jobs').addEventListener('click', () => run(() => api('jobs/clear', { method: 'POST' })));
   $('ytdlp-update').addEventListener('click', updateYtDlp);
@@ -615,11 +892,18 @@ function wire() {
 
   // Smoothly advance the seek bar between 1s polls.
   setInterval(renderSeek, 250);
+  wireStage();
 }
 
 async function start() {
+  if (SCREEN_MODE) {
+    document.title = 'Karaoke screen';
+    document.body.classList.add('screen-mode');
+    document.body.append($('stage'));
+    $('stage-window').hidden = true;
+  }
   wire();
-  const saved = storage('get');
+  const saved = prefs.get('mc-pin');
   if (!saved) {
     showLogin();
     return;

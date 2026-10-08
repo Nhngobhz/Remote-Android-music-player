@@ -11,23 +11,30 @@ import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import java.util.Collections
 import java.util.concurrent.Executors
+import java.util.concurrent.locks.ReentrantReadWriteLock
+import kotlin.concurrent.read
+import kotlin.concurrent.write
 
 /**
- * Runs yt-dlp for lib/services/ytdlp_service.dart. youtubedl-android bundles yt-dlp with
- * Python and QuickJS, which yt-dlp uses to solve YouTube's JavaScript challenges.
+ * Runs yt-dlp for lib/services/ytdlp_service.dart, which decides the options. youtubedl-android
+ * bundles yt-dlp with Python and QuickJS, which yt-dlp uses to solve YouTube's JavaScript
+ * challenges.
  *
- * Every call runs on one background thread, so an update never replaces the yt-dlp file
- * while a download is using it.
+ * Runs may overlap, so a playlist lookup doesn't wait for a long download, but an update waits
+ * for every run to finish so it never replaces the yt-dlp file while a run is using it.
  */
 object YtDlpBridge {
     private const val CHANNEL = "music_contoller/ytdlp"
     private const val TAG = "YtDlp"
 
-    private val worker = Executors.newSingleThreadExecutor()
+    private val workers = Executors.newCachedThreadPool()
     private val mainThread = Handler(Looper.getMainLooper())
     private val canceled = Collections.synchronizedSet(mutableSetOf<String>())
+
+    // Fair, so a waiting update isn't held off by runs that keep starting.
+    private val ytDlpFiles = ReentrantReadWriteLock(true)
     private var channel: MethodChannel? = null
-    private var initialized = false // Only touched on the worker thread.
+    @Volatile private var initialized = false
 
     fun attach(context: Context, messenger: BinaryMessenger) {
         val appContext = context.applicationContext
@@ -44,25 +51,27 @@ object YtDlpBridge {
             }
             "update" -> onWorker(result) {
                 ensureInit(context)
-                val status = YoutubeDL.updateYoutubeDL(context, YoutubeDL.UpdateChannel.STABLE)
-                mapOf(
-                    "updated" to (status == YoutubeDL.UpdateStatus.DONE),
-                    "version" to YoutubeDL.version(context),
-                )
+                ytDlpFiles.write {
+                    val status = YoutubeDL.updateYoutubeDL(context, YoutubeDL.UpdateChannel.STABLE)
+                    mapOf(
+                        "updated" to (status == YoutubeDL.UpdateStatus.DONE),
+                        "version" to YoutubeDL.version(context),
+                    )
+                }
             }
-            "download" -> {
+            "run" -> {
                 val id = call.argument<String>("id")!!
                 val url = call.argument<String>("url")!!
-                val dir = call.argument<String>("dir")!!
+                val options = call.argument<List<String>>("options")!!
+                val reportLines = call.argument<Boolean>("reportLines") ?: true
                 onWorker(result) {
                     ensureInit(context)
-                    download(id, url, dir)
-                    null
+                    ytDlpFiles.read { run(id, url, options, reportLines) }
                 }
             }
             "cancel" -> {
                 val id = call.argument<String>("id")!!
-                canceled.add(id) // In case the download is still waiting for the worker.
+                canceled.add(id) // In case the run hasn't started yet.
                 // Kills the process tree through a shell, so keep it off the main thread.
                 Thread { YoutubeDL.destroyProcessById(id) }.start()
                 result.success(null)
@@ -73,46 +82,35 @@ object YtDlpBridge {
 
     private fun ensureInit(context: Context) {
         if (initialized) return
-        YoutubeDL.init(context) // Unpacks Python on first run, which takes a few seconds.
-        initialized = true
+        ytDlpFiles.write {
+            if (!initialized) {
+                YoutubeDL.init(context) // Unpacks Python on first run, which takes a few seconds.
+                initialized = true
+            }
+        }
     }
 
-    private fun download(id: String, url: String, dir: String) {
+    /** Returns what yt-dlp printed to stdout. */
+    private fun run(id: String, url: String, options: List<String>, reportLines: Boolean): String {
         try {
             if (canceled.contains(id)) throw YoutubeDL.CanceledException()
-            val request = YoutubeDLRequest(url).apply {
-                addOption("--no-playlist")
-                // AAC plays everywhere; any other audio-only stream is the fallback.
-                addOption("-f", "bestaudio[ext=m4a]/bestaudio")
-                addOption("-o", "$dir/audio.%(ext)s")
-                // No ffmpeg is bundled, and the raw stream plays fine without a fixup.
-                addOption("--fixup", "never")
-                addOption("--newline")
-                addOption("--progress-delta", "0.5")
-                addOption("--socket-timeout", "30")
-                addCommands(listOf(
-                    "--print-to-file",
-                    "after_move:%(.{title,uploader,channel,duration})j",
-                    "$dir/info.json",
-                ))
-            }
+            val request = YoutubeDLRequest(url).apply { addCommands(options) }
             // Called for every output line, so it also tells Dart that yt-dlp is still alive.
-            YoutubeDL.execute(request, id) { percent, _, line ->
+            val onLine: ((Float, Long, String) -> Unit)? = if (!reportLines) null else { _, _, line ->
                 Log.d(TAG, line)
-                mainThread.post {
-                    channel?.invokeMethod(
-                        "progress",
-                        mapOf("id" to id, "percent" to percent.toDouble(), "line" to line),
-                    )
-                }
+                mainThread.post { channel?.invokeMethod("line", mapOf("id" to id, "line" to line)) }
             }
+            val response = YoutubeDL.execute(request, id, onLine)
+            // Warnings, such as a subtitle that couldn't be fetched.
+            if (response.err.isNotBlank()) Log.w(TAG, response.err.trim())
+            return response.out
         } finally {
             canceled.remove(id)
         }
     }
 
     private fun onWorker(result: MethodChannel.Result, task: () -> Any?) {
-        worker.execute {
+        workers.execute {
             try {
                 val value = task()
                 mainThread.post { result.success(value) }

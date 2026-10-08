@@ -385,7 +385,7 @@ class _LibrarySection extends StatelessWidget {
                     padding: EdgeInsets.symmetric(vertical: 24),
                     child: Text(
                       'No music yet. Open the web address above on your PC to paste '
-                      'YouTube links or upload music files.',
+                      'YouTube links or upload music and video files.',
                       textAlign: TextAlign.center,
                     ),
                   ),
@@ -441,7 +441,9 @@ class _FolderTile extends StatelessWidget {
             ListTile(
               dense: true,
               selected: track.id == currentId,
-              leading: Icon(track.id == currentId ? Icons.equalizer : Icons.music_note),
+              leading: Icon(track.id == currentId
+                  ? Icons.equalizer
+                  : (track.hasVideo ? Icons.movie_outlined : Icons.music_note)),
               title: Text(track.title, maxLines: 1, overflow: TextOverflow.ellipsis),
               subtitle: track.artist == null ? null : Text(track.artist!, maxLines: 1),
               onTap: () => run(() => player.playFolder(folder.id, startTrackId: track.id)),

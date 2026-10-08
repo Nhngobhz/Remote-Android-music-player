@@ -53,7 +53,7 @@ android {
 }
 
 dependencies {
-    // yt-dlp with Python and QuickJS, the fallback for videos youtube_explode_dart can't get.
+    // yt-dlp with Python and QuickJS, which does all YouTube downloads.
     implementation("io.github.junkfood02.youtubedl-android:library:0.18.1")
 }
 

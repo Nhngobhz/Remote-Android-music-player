@@ -7,5 +7,6 @@ class MainActivity : AudioServiceActivity() {
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         YtDlpBridge.attach(this, flutterEngine.dartExecutor.binaryMessenger)
+        MediaTools.attach(flutterEngine.dartExecutor.binaryMessenger)
     }
 }

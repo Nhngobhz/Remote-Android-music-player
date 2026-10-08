@@ -161,6 +161,9 @@ class PlayerHandler extends BaseAudioHandler with SeekHandler {
               'title': _library.trackById(track.id)?.title ?? track.title,
               'artist': track.artist,
               'folderId': track.folderId,
+              // For the karaoke screen on the web page.
+              'hasVideo': track.hasVideo,
+              'subtitles': track.subtitleFileNames.keys.toList(),
             },
       'positionMs': _player.position.inMilliseconds,
       'durationMs': _player.duration?.inMilliseconds,

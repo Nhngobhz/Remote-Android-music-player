@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:flutter/services.dart' show rootBundle;
 import 'package:shelf/shelf.dart';
 import 'package:shelf/shelf_io.dart' as shelf_io;
@@ -34,6 +35,9 @@ class ControlServer {
     'app.js': ('app.js', 'text/javascript; charset=utf-8'),
     'style.css': ('style.css', 'text/css; charset=utf-8'),
   };
+
+  /// By file extension; mp4, m4v and mov all play as MP4.
+  static const _videoTypes = {'webm': 'video/webm', 'mkv': 'video/x-matroska'};
 
   final LibraryService library;
   final PlayerHandler player;
@@ -117,7 +121,23 @@ class ControlServer {
       return _json({'ok': true});
     });
 
-    // folderId is a query param because form fields may arrive after the file parts.
+    // The karaoke screen plays the video muted, in step with the audio on the phone.
+    r.get('/api/tracks/<id>/video', (Request req, String id) {
+      final track = library.trackById(id);
+      final path = track == null ? null : library.videoPathOf(track);
+      if (path == null) return _json({'error': 'This song has no video'}, status: 404);
+      return _serveFile(req, File(path), _videoTypes[fileExtension(path)] ?? 'video/mp4');
+    });
+
+    r.get('/api/tracks/<id>/subtitles/<language>', (Request req, String id, String language) {
+      final track = library.trackById(id);
+      final path = track == null ? null : library.subtitlePathOf(track, language);
+      if (path == null) return _json({'error': 'This song has no such subtitles'}, status: 404);
+      return _serveFile(req, File(path), 'text/vtt; charset=utf-8');
+    });
+
+    // Music or video files. folderId is a query param because form fields may arrive
+    // after the file parts.
     r.post('/api/upload', (Request req) async {
       final form = req.formData();
       if (form == null) return _json({'error': 'Expected a multipart/form-data upload'}, status: 400);
@@ -151,7 +171,8 @@ class ControlServer {
       final body = await _body(req);
       final folderId = body['folderId'] as String?;
       final jobs = await youtube.enqueue(_string(body, 'url'),
-          folderId: (folderId == null || folderId.isEmpty) ? null : folderId);
+          folderId: (folderId == null || folderId.isEmpty) ? null : folderId,
+          video: body['video'] == true);
       return _json({'jobs': jobs.map((j) => j.toJson()).toList()}, status: 202);
     });
 
@@ -245,6 +266,45 @@ class ControlServer {
     });
   }
 
+  /// Serves a file, or the byte range the browser asks for: a video element needs ranges
+  /// to seek, and asks for one from the start.
+  static Future<Response> _serveFile(Request req, File file, String contentType) async {
+    final length = await file.length();
+    final headers = {
+      'content-type': contentType,
+      'accept-ranges': 'bytes',
+      // A track's files never change, so a revisited video or seek can reuse what's loaded.
+      'cache-control': 'private, max-age=86400',
+    };
+    // One range only (bytes=start-end, start- or -suffix); anything else gets the whole file.
+    final match = RegExp(r'^bytes=(\d*)-(\d*)$').firstMatch(req.headers['range']?.trim() ?? '');
+    final from = match?.group(1) ?? '';
+    final to = match?.group(2) ?? '';
+    if (match == null || (from.isEmpty && to.isEmpty)) {
+      return Response.ok(file.openRead(), headers: {...headers, 'content-length': '$length'});
+    }
+    int start;
+    int end;
+    if (from.isEmpty) {
+      start = length - int.parse(to);
+      if (start < 0) start = 0;
+      end = length - 1;
+    } else {
+      start = int.parse(from);
+      end = to.isEmpty ? length - 1 : int.parse(to);
+      if (end >= length) end = length - 1;
+    }
+    if (start >= length || start > end) {
+      return Response(HttpStatus.requestedRangeNotSatisfiable,
+          headers: {...headers, 'content-range': 'bytes */$length'});
+    }
+    return Response(HttpStatus.partialContent, body: file.openRead(start, end + 1), headers: {
+      ...headers,
+      'content-range': 'bytes $start-$end/$length',
+      'content-length': '${end - start + 1}',
+    });
+  }
+
   Handler _requirePin(Handler inner) => (Request req) {
         if (!req.url.path.startsWith('api/')) return inner(req);
 
@@ -257,7 +317,10 @@ class ControlServer {
         if (recent.length >= _maxFailures) {
           return _json({'error': 'Too many wrong PIN attempts, wait a minute'}, status: 429);
         }
-        if (req.headers['x-pin'] != settings.pin) {
+        // Video and subtitle elements can't send headers, so reads may put the PIN in the URL.
+        final readOnly = req.method == 'GET' || req.method == 'HEAD';
+        final pin = req.headers['x-pin'] ?? (readOnly ? req.url.queryParameters['pin'] : null);
+        if (pin != settings.pin) {
           _failures[ip] = recent..add(now);
           return _json({'error': 'Wrong PIN'}, status: 401);
         }
@@ -274,6 +337,11 @@ class ControlServer {
           return _json({'error': e.message}, status: 400);
         } on StateError catch (e) {
           return _json({'error': e.message}, status: 409);
+        } on YtDlpException catch (e) {
+          return _json({'error': e.message}, status: 502);
+        } on FileSystemException catch (e) {
+          debugPrint('Storage error for ${req.method} ${req.url}: $e');
+          return _json({'error': 'The phone could not use its storage (is it full?)'}, status: 500);
         } catch (e) {
           return _json({'error': 'Something went wrong on the phone: $e'}, status: 500);
         }
@@ -285,6 +353,8 @@ class ControlServer {
         'artist': t.artist,
         'folderId': t.folderId,
         'durationMs': t.durationMs,
+        'hasVideo': t.hasVideo,
+        'subtitles': t.subtitleFileNames.keys.toList(),
         'source': t.source.name,
         'sourceUrl': t.sourceUrl,
         'addedAt': t.addedAt.toIso8601String(),
