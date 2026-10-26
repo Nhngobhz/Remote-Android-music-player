@@ -38,7 +38,8 @@
         <div class="stage-lyrics"><span id="stage-lyrics" hidden></span></div>
         <div id="stage-offline" class="stage-offline" hidden>Can't reach the phone</div>
         <div class="stage-bar">
-          <select id="lyrics-lang" aria-label="Lyrics" title="Lyrics" hidden></select>
+          <button id="lyrics-toggle" aria-pressed="true" title="Show or hide the lyrics" hidden>Subtitles: On</button>
+          <select id="lyrics-lang" aria-label="Subtitle language" title="Subtitle language" hidden></select>
           <div class="sync" title="If the video or lyrics don't match the music, move them earlier or later">
             <button id="sync-earlier" aria-label="Show video earlier">−</button>
             <span id="sync-value">0.0 s</span>
@@ -95,13 +96,20 @@
         <div class="card">
           <h2>Add music</h2>
           <form id="yt-form" class="inline-form">
-            <input id="yt-url" placeholder="Paste a YouTube video or playlist link" required>
-            <button type="submit" id="yt-submit" class="primary">Download</button>
+            <input id="yt-url" placeholder="Search YouTube for a song, or paste a video or playlist link" required>
+            <button type="submit" id="yt-submit" class="primary">Search</button>
           </form>
           <label class="check">
-            <input type="checkbox" id="yt-video" checked>
+            <input type="checkbox" id="yt-video">
             Also save the video (up to 1080p) and lyrics, for karaoke
           </label>
+          <div id="yt-results" class="yt-results" hidden>
+            <div class="progress-row">
+              <span id="yt-results-title" class="muted"></span>
+              <button id="yt-results-close" class="link">Close</button>
+            </div>
+            <ul id="yt-result-list" class="results"></ul>
+          </div>
           <label id="drop-zone" class="drop-zone">
             <input type="file" id="file-input" multiple accept="audio/*,video/*,.mp3,.m4a,.aac,.ogg,.oga,.opus,.wav,.flac,.webm,.mp4,.m4v,.mov,.mkv">
             <span>Drop music or video files here, or click to choose</span>
@@ -133,8 +141,12 @@
               <button id="delete-folder" class="danger">Delete</button>
             </div>
           </div>
+          <input id="track-search" class="track-search" type="search" placeholder="Search songs" aria-label="Search songs" hidden>
           <ul id="track-list" class="tracks"></ul>
-          <p id="empty-tracks" class="empty muted" hidden>No songs here yet. Paste a YouTube link or drop music or video files above.</p>
+          <p id="empty-tracks" class="empty muted" hidden>
+            <span id="empty-tracks-text"></span>
+            <button id="search-all" class="link" hidden>Search all music</button>
+          </p>
         </div>
       </section>
     </main>

@@ -143,6 +143,37 @@ void main() {
     expect(options[options.indexOf('--playlist-items') + 1], '1:300');
   });
 
+  test('search lists what YouTube finds, without live or upcoming streams', () async {
+    final fake = FakeYtDlp()
+      ..playlistJson = '{"title": "despacito", "entries": ['
+          '{"id": "kJQP7kiw5Fk", "title": "Despacito", "channel": "Luis Fonsi", "duration": 282.0},'
+          '{"id": "aaaaaaaaaaa", "title": "Despacito karaoke", "uploader": "Sing King", "duration": null},'
+          '{"id": "bbbbbbbbbbb", "title": "Radio", "live_status": "is_live"},'
+          '{"id": "ccccccccccc", "title": "Premiere", "live_status": "is_upcoming"}]}\n';
+    addTearDown(fake.dispose);
+
+    final results = await ytDlp.search('despacito', limit: 12);
+
+    expect(results.map((v) => v.toJson()), [
+      {
+        'id': 'kJQP7kiw5Fk',
+        'url': 'https://www.youtube.com/watch?v=kJQP7kiw5Fk',
+        'title': 'Despacito',
+        'channel': 'Luis Fonsi',
+        'durationMs': 282000,
+      },
+      {
+        'id': 'aaaaaaaaaaa',
+        'url': 'https://www.youtube.com/watch?v=aaaaaaaaaaa',
+        'title': 'Despacito karaoke',
+        'channel': 'Sing King',
+        'durationMs': null,
+      },
+    ]);
+    expect(fake.runs.single.url, 'ytsearch12:despacito');
+    expect(fake.runs.single.options, containsAll(['--flat-playlist', '--dump-single-json']));
+  });
+
   test('YtDlpProgress maps each stream to its share of the bar', () {
     final progress = YtDlpProgress(video: true);
     expect(progress.onLine('[download]  40.0% of 1MiB'), isNull, reason: 'no stream started yet');

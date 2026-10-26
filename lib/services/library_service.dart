@@ -106,6 +106,16 @@ class LibraryService extends ChangeNotifier {
   List<Track> tracksIn(String folderId) =>
       _tracks.where((t) => t.folderId == folderId).toList();
 
+  /// Songs whose title or artist has every word of [query] in it, ignoring case.
+  List<Track> search(String query) {
+    final words = query.toLowerCase().split(RegExp(r'\s+')).where((w) => w.isNotEmpty).toList();
+    if (words.isEmpty) return [];
+    return _tracks.where((t) {
+      final text = '${t.title} ${t.artist ?? ''}'.toLowerCase();
+      return words.every(text.contains);
+    }).toList();
+  }
+
   MusicFolder createFolder(String name) {
     final clean = _cleanName(name);
     if (folderByName(clean) != null) {

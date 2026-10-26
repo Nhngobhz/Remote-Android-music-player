@@ -176,6 +176,11 @@ class ControlServer {
       return _json({'jobs': jobs.map((j) => j.toJson()).toList()}, status: 202);
     });
 
+    r.get('/api/youtube/search', (Request req) async {
+      final results = await youtube.search(req.url.queryParameters['q'] ?? '');
+      return _json({'results': results.map((v) => v.toJson()).toList()});
+    });
+
     r.post('/api/jobs/<id>/retry', (Request _, String id) {
       youtube.retry(id);
       return _json({'ok': true});

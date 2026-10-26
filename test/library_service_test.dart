@@ -57,6 +57,34 @@ void main() {
     expect(reopened.trackById(track.id)?.folderId, folder.id);
   });
 
+  test('search finds songs with every word in the title or artist, ignoring case', () async {
+    final library = await open();
+    Future<Track> add(String title, {String? artist}) async {
+      if (artist == null) {
+        return library.importStream(bytes(8),
+            extension: 'mp3', title: title, folderId: null, source: TrackSource.upload);
+      }
+      // Uploads have no artist; a YouTube download's channel ends up there.
+      final dir = await Directory('${root.path}/dl-$title').create();
+      return library.importFiles(
+        audio: await File('${dir.path}/audio.m4a').writeAsBytes([1]),
+        title: title,
+        artist: artist,
+        source: TrackSource.youtube,
+      );
+    }
+
+    final despacito = await add('Despacito', artist: 'Luis Fonsi');
+    final karaoke = await add('Despacito (Karaoke Version)');
+    await add('Shape of You');
+
+    expect(library.search('despacito'), [despacito, karaoke]);
+    expect(library.search('  FONSI   despacito '), [despacito]);
+    expect(library.search('karaoke despacito'), [karaoke]);
+    expect(library.search('hello'), isEmpty);
+    expect(library.search('  '), isEmpty);
+  });
+
   test('unknown folder falls back to Unsorted and bad formats are rejected', () async {
     final library = await open();
     final track = await library.importStream(bytes(10),

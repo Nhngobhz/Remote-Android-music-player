@@ -340,6 +340,17 @@ void main() {
     expect(library.tracks, isEmpty);
   });
 
+  test('YouTube search needs words, and says when yt-dlp is missing', () async {
+    final (status, body) = await call('GET', '/api/youtube/search?q=%20');
+    expect(status, 400);
+    expect(body['error'], contains('search'));
+
+    // There is no yt-dlp off Android.
+    final (missing, error) = await call('GET', '/api/youtube/search?q=despacito');
+    expect(missing, 502);
+    expect(error['error'], contains('Android'));
+  });
+
   test('player commands validate input and explain an empty library', () async {
     final (status, body) = await call('POST', '/api/player/play', json: {});
     expect(status, 409);

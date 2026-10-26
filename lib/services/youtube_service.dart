@@ -49,6 +49,7 @@ class YoutubeService extends ChangeNotifier {
   YoutubeService(this._library, this._ytDlp);
 
   static const _maxPlaylistVideos = 300;
+  static const _searchResults = 12;
   static const _keepFinishedJobs = 30;
   static const _uuid = Uuid();
 
@@ -83,6 +84,13 @@ class YoutubeService extends ChangeNotifier {
     notifyListeners();
     _pump();
     return created;
+  }
+
+  /// Looks [query] up on YouTube, for when there's no link to paste.
+  Future<List<YtDlpVideo>> search(String query) {
+    final text = query.trim();
+    if (text.isEmpty) throw ArgumentError('Type a song to search for');
+    return _ytDlp.search(text, limit: _searchResults);
   }
 
   void retry(String jobId) {

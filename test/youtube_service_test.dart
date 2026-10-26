@@ -105,6 +105,17 @@ void main() {
     expect(youtube.jobs, isEmpty);
   });
 
+  test('search looks up the trimmed words and refuses an empty search', () async {
+    fake.playlistJson = '{"entries": [{"id": "kJQP7kiw5Fk", "title": "Despacito"}]}';
+
+    final results = await youtube.search('  luis fonsi despacito ');
+
+    expect(results.single.url, 'https://www.youtube.com/watch?v=kJQP7kiw5Fk');
+    expect(fake.runs.single.url, 'ytsearch12:luis fonsi despacito');
+    expect(() => youtube.search('   '), throwsArgumentError);
+    expect(youtube.jobs, isEmpty);
+  });
+
   test('common yt-dlp errors get a plain explanation', () {
     expect(YoutubeService.describeError(const YtDlpException('Unable to download webpage: HTTP Error 429: Too Many Requests')),
         contains('rate-limiting'));

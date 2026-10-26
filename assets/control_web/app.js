@@ -19,6 +19,8 @@ const state = {
   player: null,
   playerReceivedAt: 0,
   selectedFolder: 'all',
+  searchQuery: '',
+  ytSearch: 0, // counts YouTube searches, so a stale one can't show its results
   seeking: false,
   volumeDragging: false,
   currentTrackId: null,
@@ -30,7 +32,8 @@ const stage = {
   trackId: undefined, // song whose video and lyrics are loaded; null when nothing plays
   hasVideo: false,
   subtitles: [],
-  lyricsLang: 'off',
+  lyricsOn: true, // off for every song once turned off, e.g. for videos with the words in the picture
+  lyricsLang: null,
   cues: [],
   clock: null, // estimate of the phone's playback position, see updatePhoneClock
   offsetMs: 0, // how much later than the music the video and lyrics are shown
@@ -342,34 +345,39 @@ function languageName(code) {
 
 function renderLyricsChoices() {
   const select = $('lyrics-lang');
-  select.replaceChildren(
-    el('option', { value: 'off', text: 'Lyrics off' }),
-    ...stage.subtitles.map((code) => el('option', { value: code, text: languageName(code) })),
-  );
-  select.hidden = stage.subtitles.length === 0;
+  select.replaceChildren(...stage.subtitles.map((code) => el('option', { value: code, text: languageName(code) })));
   stage.lyricsLang = pickLyrics(stage.subtitles);
-  select.value = stage.lyricsLang;
+  if (stage.lyricsLang) select.value = stage.lyricsLang;
+  renderLyricsToggle();
+}
+
+function renderLyricsToggle() {
+  const toggle = $('lyrics-toggle');
+  toggle.hidden = stage.subtitles.length === 0;
+  toggle.textContent = stage.lyricsOn ? 'Subtitles: On' : 'Subtitles: Off';
+  toggle.setAttribute('aria-pressed', String(stage.lyricsOn));
+  $('lyrics-lang').hidden = !stage.lyricsOn || stage.subtitles.length < 2;
 }
 
 // The language chosen last time (or the same language from another region), else the first.
 function pickLyrics(codes) {
   const wanted = prefs.get('mc-lyrics');
-  if (wanted === 'off' || codes.length === 0) return 'off';
   const base = (code) => code.split('-')[0].toLowerCase();
   return codes.find((c) => c === wanted)
     ?? codes.find((c) => wanted && base(c) === base(wanted))
-    ?? codes[0];
+    ?? codes[0]
+    ?? null;
 }
 
 async function loadLyrics() {
   stage.cues = [];
   const { trackId, lyricsLang } = stage;
-  if (!trackId || lyricsLang === 'off') return;
+  if (!trackId || !lyricsLang || !stage.lyricsOn) return;
   try {
     const res = await fetch(mediaUrl(`tracks/${trackId}/subtitles/${encodeURIComponent(lyricsLang)}`));
     if (!res.ok) return;
     const cues = parseVtt(await res.text());
-    if (stage.trackId === trackId && stage.lyricsLang === lyricsLang) stage.cues = cues;
+    if (stage.trackId === trackId && stage.lyricsLang === lyricsLang && stage.lyricsOn) stage.cues = cues;
   } catch { /* no lyrics this time; the video carries on */ }
 }
 
@@ -451,16 +459,24 @@ function toggleFullscreen() {
   }
 }
 
-// The control bar shows while the mouse moves over the video, then gets out of the way.
+// The control bar and the mouse pointer show while the mouse moves over the video, then get
+// out of the way. The bar stays while the pointer rests on it, e.g. with the language list open.
 function showStageBar() {
   const node = $('stage');
   node.classList.add('active');
   node.classList.remove('idle');
   clearTimeout(stage.barTimer);
-  stage.barTimer = setTimeout(() => {
-    node.classList.remove('active');
-    node.classList.add('idle');
-  }, 2500);
+  stage.barTimer = setTimeout(hideStageBar, 2500);
+}
+
+function hideStageBar() {
+  const node = $('stage');
+  if (node.querySelector('.stage-bar').matches(':hover')) {
+    stage.barTimer = setTimeout(hideStageBar, 2500);
+    return;
+  }
+  node.classList.remove('active');
+  node.classList.add('idle');
 }
 
 function wireStage() {
@@ -481,6 +497,12 @@ function wireStage() {
   });
   $('sync-earlier').addEventListener('click', () => setSyncOffset(stage.offsetMs - SYNC_STEP_MS));
   $('sync-later').addEventListener('click', () => setSyncOffset(stage.offsetMs + SYNC_STEP_MS));
+  $('lyrics-toggle').addEventListener('click', () => {
+    stage.lyricsOn = !stage.lyricsOn;
+    prefs.set('mc-subtitles', stage.lyricsOn ? 'on' : 'off');
+    renderLyricsToggle();
+    loadLyrics();
+  });
   $('lyrics-lang').addEventListener('change', (e) => {
     stage.lyricsLang = e.target.value;
     prefs.set('mc-lyrics', stage.lyricsLang);
@@ -494,6 +516,7 @@ function wireStage() {
     video.hidden = true;
   });
 
+  stage.lyricsOn = prefs.get('mc-subtitles') !== 'off';
   setSyncOffset(Number(prefs.get('mc-sync')) || 0);
   setInterval(tickStage, 100);
 }
@@ -547,15 +570,36 @@ function selectFolder(id) {
 
 // ---------- Tracks ----------
 
+// Lower case without accents, so "cafe" finds "Café". Only Latin accents are dropped: in
+// scripts such as Khmer, the combining marks are vowels.
+function foldText(text) {
+  return text.normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+}
+
+// Songs whose title or artist has every word typed in the search box.
+function matchesSearch(track, words) {
+  const text = foldText(`${track.title} ${track.artist ?? ''}`);
+  return words.every((word) => text.includes(word));
+}
+
 function renderTracks() {
   const list = $('track-list');
   list.replaceChildren();
-  const tracks = state.selectedFolder === 'all'
+  const inFolder = state.selectedFolder === 'all'
     ? state.library.tracks
     : state.library.tracks.filter((t) => t.folderId === state.selectedFolder);
+  const query = state.searchQuery.trim();
+  const words = foldText(query).split(/\s+/).filter(Boolean);
+  const tracks = words.length ? inFolder.filter((t) => matchesSearch(t, words)) : inFolder;
+  $('track-search').hidden = state.library.tracks.length === 0;
   $('empty-tracks').hidden = tracks.length > 0;
-  $('play-folder').disabled = tracks.length === 0;
-  $('shuffle-folder').disabled = tracks.length === 0;
+  const where = state.selectedFolder === 'all' ? '' : ` in "${folderName(state.selectedFolder)}"`;
+  $('empty-tracks-text').textContent = inFolder.length === 0
+    ? 'No songs here yet. Search YouTube or paste a link, or drop music or video files above.'
+    : `No songs${where} match "${query}".`;
+  $('search-all').hidden = inFolder.length === 0 || state.selectedFolder === 'all';
+  $('play-folder').disabled = inFolder.length === 0;
+  $('shuffle-folder').disabled = inFolder.length === 0;
 
   for (const track of tracks) {
     const moveSelect = el('select', {
@@ -688,6 +732,92 @@ function renderYtDlp(info) {
   if (info.updateError && !info.updating) text += ` (last update failed: ${info.updateError})`;
   $('ytdlp-text').textContent = text;
   $('ytdlp-update').disabled = info.updating;
+}
+
+// Links (and bare playlist ids) are downloaded; anything else is looked up on YouTube.
+function isYoutubeLink(text) {
+  return /^https?:\/\/|youtube(-nocookie)?\.com\/|youtu\.be\//i.test(text)
+    || /^(PL|RD|OLAK5uy_|UU|UL|PU|FL|LL)[\w-]{10,}$/.test(text);
+}
+
+function updateYtButton() {
+  $('yt-submit').textContent = isYoutubeLink($('yt-url').value.trim()) ? 'Download' : 'Search';
+}
+
+// Queues a YouTube link on the phone, with the video too when the box is ticked.
+async function addDownload(url) {
+  const video = $('yt-video').checked;
+  const result = await run(() => api('youtube', {
+    method: 'POST',
+    body: { url, folderId: targetFolderId(), video },
+  }));
+  if (!result) return false;
+  const n = result.jobs.length;
+  const what = n === 1 ? 'Added to downloads' : `Added ${n} songs from the playlist to downloads`;
+  toast(video ? `${what}, with video` : what);
+  poll();
+  return true;
+}
+
+// The phone searches with yt-dlp, which takes a few seconds.
+async function searchYoutube(query) {
+  const token = ++state.ytSearch;
+  const button = $('yt-submit');
+  button.disabled = true;
+  button.textContent = 'Searching…';
+  $('yt-results').hidden = false;
+  $('yt-results-title').textContent = `Searching YouTube for "${query}"…`;
+  $('yt-result-list').replaceChildren();
+  const data = await run(() => api('youtube/search?q=' + encodeURIComponent(query)));
+  button.disabled = false;
+  updateYtButton();
+  if (token !== state.ytSearch) return;
+  if (!data) {
+    $('yt-results').hidden = true;
+    return;
+  }
+  $('yt-results-title').textContent = data.results.length
+    ? `YouTube results for "${query}"`
+    : `YouTube found nothing for "${query}"`;
+  const saved = new Set(state.library.tracks.map((t) => t.sourceUrl).filter(Boolean));
+  $('yt-result-list').replaceChildren(...data.results.map((video) => youtubeResult(video, saved.has(video.url))));
+}
+
+function closeYoutubeResults() {
+  state.ytSearch++;
+  $('yt-results').hidden = true;
+  $('yt-result-list').replaceChildren();
+}
+
+function youtubeResult(video, saved) {
+  const title = video.title || video.url;
+  const sub = [video.channel, video.durationMs ? formatTime(video.durationMs) : null].filter(Boolean).join(' · ');
+  // Thumbnails come straight from YouTube, so they only show when the PC is online too.
+  const thumb = video.id
+    ? el('img', {
+      class: 'thumb',
+      alt: '',
+      loading: 'lazy',
+      src: `https://i.ytimg.com/vi/${encodeURIComponent(video.id)}/mqdefault.jpg`,
+      onerror: (e) => e.target.classList.add('broken'),
+    })
+    : el('span', { class: 'thumb' });
+  const download = el('button', {
+    text: 'Download',
+    onclick: async () => {
+      download.disabled = true;
+      if (await addDownload(video.url)) download.textContent = 'Added';
+      else download.disabled = false;
+    },
+  });
+  return el('li', {}, [
+    thumb,
+    el('div', { class: 'r-main' }, [
+      el('a', { class: 'r-title', href: video.url, target: '_blank', rel: 'noopener', text: title, title }),
+      el('div', { class: 'r-sub' }, [...(saved ? [el('span', { class: 'tag', text: 'In library' })] : []), sub]),
+    ]),
+    download,
+  ]);
 }
 
 async function updateYtDlp() {
@@ -847,26 +977,31 @@ function wire() {
   $('yt-form').addEventListener('submit', async (e) => {
     e.preventDefault();
     const input = $('yt-url');
+    const text = input.value.trim();
+    if (!text) return;
+    if (!isYoutubeLink(text)) {
+      searchYoutube(text);
+      return;
+    }
     const button = $('yt-submit');
     button.disabled = true;
     button.textContent = 'Working…';
-    const video = $('yt-video').checked;
-    const result = await run(() => api('youtube', {
-      method: 'POST',
-      body: { url: input.value, folderId: targetFolderId(), video },
-    }));
+    const added = await addDownload(text);
     button.disabled = false;
-    button.textContent = 'Download';
-    if (!result) return;
-    input.value = '';
-    const n = result.jobs.length;
-    const what = n === 1 ? 'Added to downloads' : `Added ${n} songs from the playlist to downloads`;
-    toast(video ? `${what}, with video` : what);
-    poll();
+    if (added) input.value = '';
+    updateYtButton();
   });
-  const withVideo = prefs.get('mc-yt-video');
+  $('yt-url').addEventListener('input', updateYtButton);
+  $('yt-results-close').addEventListener('click', closeYoutubeResults);
+  const withVideo = prefs.get('mc-video');
   if (withVideo !== null) $('yt-video').checked = withVideo === '1';
-  $('yt-video').addEventListener('change', (e) => prefs.set('mc-yt-video', e.target.checked ? '1' : '0'));
+  $('yt-video').addEventListener('change', (e) => prefs.set('mc-video', e.target.checked ? '1' : '0'));
+
+  $('track-search').addEventListener('input', (e) => {
+    state.searchQuery = e.target.value;
+    renderTracks();
+  });
+  $('search-all').addEventListener('click', () => selectFolder('all'));
 
   $('clear-jobs').addEventListener('click', () => run(() => api('jobs/clear', { method: 'POST' })));
   $('ytdlp-update').addEventListener('click', updateYtDlp);

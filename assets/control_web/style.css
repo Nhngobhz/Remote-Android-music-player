@@ -193,6 +193,26 @@ input[type=range] { accent-color: var(--accent); }
 .bar > div { height: 100%; width: 0; background: var(--accent); transition: width .3s; }
 .job-error { font-size: 12px; color: var(--danger); display: flex; gap: 8px; align-items: center; justify-content: space-between; }
 
+.yt-results { margin-top: 12px; }
+.results { list-style: none; margin: 4px 0 0; padding: 0; display: grid; gap: 2px; max-height: 480px; overflow-y: auto; }
+.results li {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding: 6px;
+  border-radius: 8px;
+}
+.results li:hover { background: var(--surface-2); }
+.results .thumb { display: block; width: 96px; aspect-ratio: 16 / 9; object-fit: cover; border-radius: 6px; background: var(--surface-2); }
+.results .thumb.broken { visibility: hidden; }
+.r-main { min-width: 0; }
+.r-title { display: block; color: inherit; text-decoration: none; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.r-title:hover { text-decoration: underline; }
+.r-sub { font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.track-search { width: 100%; margin-bottom: 8px; }
+
 .tracks { list-style: none; margin: 0; padding: 0; display: grid; }
 .tracks li {
   display: grid;
@@ -273,10 +293,12 @@ input[type=range] { accent-color: var(--accent); }
   background: linear-gradient(rgba(0, 0, 0, 0.75), transparent);
   font-size: 13px;
   opacity: 0;
+  /* A click where the hidden bar is only brings it back. */
+  pointer-events: none;
   transition: opacity 0.2s;
 }
-.stage.active .stage-bar, .stage-bar:focus-within { opacity: 1; }
-.stage.idle:fullscreen, body.screen-mode .stage.idle { cursor: none; }
+.stage.active .stage-bar, .stage-bar:has(:focus-visible) { opacity: 1; pointer-events: auto; }
+.stage.idle { cursor: none; }
 .stage-offline {
   position: absolute; left: 12px; bottom: 12px;
   padding: 4px 10px;
@@ -317,5 +339,6 @@ body.screen-mode .stage { position: fixed; inset: 0; aspect-ratio: auto; border-
   .player.has-stage { grid-template-columns: 1fr; }
   .volume { margin-left: 0; width: 100%; justify-content: center; }
   .tracks li { grid-template-columns: auto 1fr auto; }
+  .results .thumb { width: 64px; }
   .t-actions { grid-column: 1 / -1; justify-content: flex-end; }
 }

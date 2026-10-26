@@ -126,6 +126,11 @@ class YtDlpService extends ChangeNotifier {
     return YtDlpPlaylist.parse(out);
   }
 
+  /// The first [limit] videos YouTube finds for [query], best match first. yt-dlp lists
+  /// search results the same way as a playlist.
+  Future<List<YtDlpVideo>> search(String query, {required int limit}) async =>
+      (await listPlaylist('ytsearch$limit:$query', limit: limit)).videos;
+
   /// The yt-dlp options for a download into [dir]. There is no ffmpeg on the phone to
   /// merge streams, so audio and video are saved as separate files: the phone plays the
   /// audio and the web page shows the video in step with it.
@@ -337,25 +342,48 @@ class YtDlpDownload {
   }
 }
 
+/// A video in a playlist or in search results.
+class YtDlpVideo {
+  const YtDlpVideo({required this.url, this.id, this.title, this.channel, this.durationMs});
+
+  final String url;
+  final String? id;
+  final String? title;
+  final String? channel;
+  final int? durationMs;
+
+  Map<String, dynamic> toJson() =>
+      {'id': id, 'url': url, 'title': title, 'channel': channel, 'durationMs': durationMs};
+}
+
 class YtDlpPlaylist {
   YtDlpPlaylist({required this.title, required this.videos});
 
   final String? title;
-  final List<({String url, String? title})> videos;
+  final List<YtDlpVideo> videos;
 
   /// Reads yt-dlp's --dump-single-json output. Private and deleted videos still show up
-  /// in playlists, but can't be downloaded.
+  /// in playlists, but can't be downloaded, and neither can a live or upcoming stream.
   static YtDlpPlaylist parse(String output) {
     final json = const LineSplitter().convert(output).lastWhere((l) => l.startsWith('{'),
         orElse: () => throw const YtDlpException('yt-dlp did not list the playlist'));
     final data = jsonDecode(json) as Map<String, dynamic>;
-    final videos = <({String url, String? title})>[];
+    final videos = <YtDlpVideo>[];
     for (final entry in (data['entries'] as List? ?? const []).whereType<Map<String, dynamic>>()) {
       final title = entry['title'] as String?;
       if (title == '[Private video]' || title == '[Deleted video]') continue;
+      if (entry['live_status'] == 'is_live' || entry['live_status'] == 'is_upcoming') continue;
       final id = entry['id'] as String?;
       final url = id != null ? 'https://www.youtube.com/watch?v=$id' : entry['url'] as String?;
-      if (url != null) videos.add((url: url, title: title));
+      if (url == null) continue;
+      final duration = entry['duration'];
+      videos.add(YtDlpVideo(
+        url: url,
+        id: id,
+        title: title,
+        channel: (entry['channel'] ?? entry['uploader']) as String?,
+        durationMs: duration is num ? (duration * 1000).round() : null,
+      ));
     }
     return YtDlpPlaylist(title: data['title'] as String?, videos: videos);
   }
